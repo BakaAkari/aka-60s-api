@@ -9,11 +9,19 @@
     "dist"
   ],
   "license": "MIT",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
   "keywords": [
     "chatbot",
     "koishi",
     "plugin"
   ],
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
   "peerDependencies": {
     "koishi": "^4.18.9"
   }
