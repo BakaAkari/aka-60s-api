@@ -4,6 +4,7 @@ export const name = 'aka-60s-api'
 export const inject = ['database']
 
 export interface Config {
+  apiBaseUrl: string
   cooldownTime: number
   enableLog: boolean
   scheduleWhitelist: string[]
@@ -24,31 +25,32 @@ export interface Config {
 
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
+    apiBaseUrl: Schema.string().default('http://172.0.0.1:4399').description('60s 服务 URL（不含 /v2 路径）'),
     cooldownTime: Schema.number().default(30).min(5).max(300).description('冷却时间(秒)'),
     enableLog: Schema.boolean().default(true).description('启用日志记录'),
-    scheduleWhitelist: Schema.array(String).default([]).description('定时发送群组白名单频道ID列表（为空=不发送）')
+    scheduleWhitelist: Schema.array(String).default([]).description('定时发送群组白名单频道ID列表（格式: platform:channelId，如 onebot:123456）')
   }).description('基础设置'),
   Schema.object({
     enableSchedule: Schema.boolean().default(false).description('启用定时发送新闻'),
-    scheduleTime: Schema.string().default('08:00 / 1d').description('定时发送时间 (格式: HH:MM / 1d)'),
+    scheduleTime: Schema.string().default('08:00').description('定时发送时间 (格式: HH:MM，每天固定时间)'),
     useForward: Schema.boolean().default(false).description('是否使用合并转发(仅QQ平台效果最佳)')
   }).description('每日新闻'),
   Schema.object({
     enableAiNewsSchedule: Schema.boolean().default(false).description('启用AI快报定时发送(仅当天)'),
-    aiNewsScheduleTime: Schema.string().default('22:00 / 1d').description('AI快报定时发送时间 (格式: HH:MM / 1d)'),
+    aiNewsScheduleTime: Schema.string().default('22:00').description('AI快报定时发送时间 (格式: HH:MM，每天固定时间)'),
     aiUseForward: Schema.boolean().default(false).description('AI快报是否使用合并转发(仅QQ平台效果最佳)')
   }).description('AI快报'),
   Schema.object({
     enableMoyuSchedule: Schema.boolean().default(false).description('启用摸鱼日报定时发送'),
-    moyuScheduleTime: Schema.string().default('10:00 / 1d').description('摸鱼日报定时发送时间 (格式: HH:MM / 1d)'),
+    moyuScheduleTime: Schema.string().default('10:00').description('摸鱼日报定时发送时间 (格式: HH:MM，每天固定时间)'),
   }).description('摸鱼日报'),
   Schema.object({
     enableGoldSchedule: Schema.boolean().default(false).description('启用今日金价定时发送'),
-    goldScheduleTime: Schema.string().default('09:00 / 1d').description('今日金价定时发送时间 (格式: HH:MM / 1d)'),
+    goldScheduleTime: Schema.string().default('09:00').description('今日金价定时发送时间 (格式: HH:MM，每天固定时间)'),
   }).description('今日金价'),
   Schema.object({
     enableFuelSchedule: Schema.boolean().default(false).description('启用今日油价定时发送'),
-    fuelScheduleTime: Schema.string().default('09:30 / 1d').description('今日油价定时发送时间 (格式: HH:MM / 1d)'),
+    fuelScheduleTime: Schema.string().default('09:30').description('今日油价定时发送时间 (格式: HH:MM，每天固定时间)'),
     fuelDefaultRegion: Schema.string().default('上海').description('今日油价默认地区')
   }).description('今日油价')
 ])
@@ -272,12 +274,14 @@ interface FuelResponse {
 
 export function apply(ctx: Context, config: Config) {
   const logger = ctx.logger('aka-60s-api')
+  const normalizedApiBaseUrl = (config.apiBaseUrl || 'http://172.0.0.1:4399').replace(/\/$/, '')
+  const buildApiUrl = (path: string) => `${normalizedApiBaseUrl}${path}`
   const cooldowns: Map<string, number> = new Map()
-  let scheduleInterval: NodeJS.Timeout | null = null
-  let aiNewsScheduleInterval: NodeJS.Timeout | null = null
-  let moyuScheduleInterval: NodeJS.Timeout | null = null
-  let goldScheduleInterval: NodeJS.Timeout | null = null
-  let fuelScheduleInterval: NodeJS.Timeout | null = null
+  let scheduleTimeout: NodeJS.Timeout | null = null
+  let aiNewsScheduleTimeout: NodeJS.Timeout | null = null
+  let moyuScheduleTimeout: NodeJS.Timeout | null = null
+  let goldScheduleTimeout: NodeJS.Timeout | null = null
+  let fuelScheduleTimeout: NodeJS.Timeout | null = null
 
   async function resolveGroupScheduleChannels(whitelist: string[], tag: string): Promise<string[]> {
     try {
@@ -286,21 +290,69 @@ export function apply(ctx: Context, config: Config) {
         return []
       }
 
+      // 白名单兼容：
+      // - 支持 platform:channelId（推荐）
+      // - 兼容仅填写 channelId（例如 onebot 群号）
+      // - 兼容常见尾缀（例如 onebot:123456@group）
+      const normalize = (raw: string) => {
+        const value = String(raw || '').trim()
+        const withoutAt = value.includes('@') ? value.split('@')[0] : value
+        const [platform, id] = withoutAt.includes(':') ? withoutAt.split(':', 2) : ['', withoutAt]
+        return {
+          raw: value,
+          withoutAt,
+          platform,
+          id,
+        }
+      }
+
+      const whitelistNormalized = whitelist.map(normalize).filter((item) => item.withoutAt)
+      const whitelistKeys = new Set<string>()
+      whitelistNormalized.forEach((item) => {
+        whitelistKeys.add(item.raw)
+        whitelistKeys.add(item.withoutAt)
+        if (item.id) whitelistKeys.add(item.id)
+      })
+
       const assigned = await ctx.database.getAssignedChannels(['id', 'platform', 'guildId'])
+      logInfo('60s API: 获取到的频道列表', {
+        tag,
+        count: assigned.length,
+        channels: assigned.map((c) => ({ platform: c.platform, id: c.id, guildId: c.guildId })),
+      })
+
       const groupChannels = assigned
         .filter((channel) => !!channel.guildId)
-        .map((channel) => `${channel.platform}:${channel.id}`)
+        .map((channel) => ({
+          platform: channel.platform,
+          id: channel.id,
+          key: `${channel.platform}:${channel.id}`,
+        }))
 
       if (!groupChannels.length) {
         logInfo('60s API: 没有可发送的群组频道', { tag })
         return []
       }
 
-      const whitelistSet = new Set(whitelist)
-      const targets = groupChannels.filter((channelId) => whitelistSet.has(channelId))
+      logInfo('60s API: 群组频道列表', { tag, channels: groupChannels.map((c) => c.key) })
+      logInfo('60s API: 白名单配置(原始)', { tag, whitelist })
+      logInfo('60s API: 白名单配置(规范化)', {
+        tag,
+        whitelist: whitelistNormalized.map((w) => ({ raw: w.raw, withoutAt: w.withoutAt, id: w.id })),
+      })
+
+      const targets = groupChannels
+        .filter((c) => whitelistKeys.has(c.key) || whitelistKeys.has(c.id))
+        .map((c) => c.key)
 
       if (!targets.length) {
-        logInfo('60s API: 白名单未命中任何已加入群组频道', { tag })
+        logInfo('60s API: 白名单未命中任何已加入群组频道', {
+          tag,
+          groupChannels: groupChannels.map((c) => c.key),
+          whitelist,
+        })
+      } else {
+        logInfo('60s API: 白名单匹配成功', { tag, targets })
       }
 
       return targets
@@ -343,7 +395,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取新闻图片')
       
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/60s', {
+      const response = await ctx.http.get(buildApiUrl('/v2/60s'), {
         params: {
           encoding: 'image'
         },
@@ -369,7 +421,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取历史上的今天')
       
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/today-in-history', {
+      const response = await ctx.http.get(buildApiUrl('/v2/today-in-history'), {
         params: {
           encoding: 'json'
         },
@@ -394,7 +446,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取知乎话题榜')
       
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/zhihu', {
+      const response = await ctx.http.get(buildApiUrl('/v2/zhihu'), {
         params: {
           encoding: 'json'
         },
@@ -419,7 +471,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取AI快报', params)
 
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/ai-news', {
+      const response = await ctx.http.get(buildApiUrl('/v2/ai-news'), {
         params: {
           date: params.date,
           all: params.all,
@@ -441,7 +493,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取摸鱼日报', { encoding })
 
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/moyu', {
+      const response = await ctx.http.get(buildApiUrl('/v2/moyu'), {
         params: {
           encoding
         },
@@ -461,7 +513,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取今日金价', { encoding })
 
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/gold-price', {
+      const response = await ctx.http.get(buildApiUrl('/v2/gold-price'), {
         params: {
           encoding
         },
@@ -481,7 +533,7 @@ export function apply(ctx: Context, config: Config) {
     try {
       logInfo('60s API: 开始获取今日油价', params)
 
-      const response = await ctx.http.get('http://192.168.50.55:4399/v2/fuel-price', {
+      const response = await ctx.http.get(buildApiUrl('/v2/fuel-price'), {
         params: {
           region: params.region,
           encoding: params.encoding || 'text'
@@ -501,7 +553,10 @@ export function apply(ctx: Context, config: Config) {
   // 发送新闻到指定频道
   async function sendNewsToChannels() {
     const targetChannels = await resolveGroupScheduleChannels(config.scheduleWhitelist, 'news')
-    if (targetChannels.length === 0) return
+    if (targetChannels.length === 0) {
+      logInfo('60s API: 没有目标频道，跳过新闻发送')
+      return
+    }
 
     try {
       const imageBuffer = await get60sNewsImage()
@@ -580,7 +635,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function sendAiNewsToChannels() {
     const targetChannels = await resolveGroupScheduleChannels(config.scheduleWhitelist, 'ai-news')
-    if (targetChannels.length === 0) return
+    if (targetChannels.length === 0) {
+      logInfo('60s API: 没有目标频道，跳过AI快报发送')
+      return
+    }
 
     try {
       const response = await getAiNews({ encoding: 'json' }) as AiNewsResponse
@@ -627,7 +685,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function sendMoyuToChannels() {
     const targetChannels = await resolveGroupScheduleChannels(config.scheduleWhitelist, 'moyu')
-    if (targetChannels.length === 0) return
+    if (targetChannels.length === 0) {
+      logInfo('60s API: 没有目标频道，跳过摸鱼日报发送')
+      return
+    }
 
     try {
       const response = await getMoyuDaily('json') as MoyuResponse
@@ -693,7 +754,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function sendGoldToChannels() {
     const targetChannels = await resolveGroupScheduleChannels(config.scheduleWhitelist, 'gold')
-    if (targetChannels.length === 0) return
+    if (targetChannels.length === 0) {
+      logInfo('60s API: 没有目标频道，跳过金价发送')
+      return
+    }
 
     try {
       const response = await getGoldPrice('json') as GoldResponse
@@ -719,7 +783,10 @@ export function apply(ctx: Context, config: Config) {
 
   async function sendFuelToChannels() {
     const targetChannels = await resolveGroupScheduleChannels(config.scheduleWhitelist, 'fuel')
-    if (targetChannels.length === 0) return
+    if (targetChannels.length === 0) {
+      logInfo('60s API: 没有目标频道，跳过油价发送')
+      return
+    }
 
     try {
       const response = await getFuelPrice({ region: config.fuelDefaultRegion, encoding: 'json' }) as FuelResponse
@@ -743,65 +810,51 @@ export function apply(ctx: Context, config: Config) {
     }
   }
 
-  // 解析时间格式
-  function parseScheduleTime(timeStr: string): number {
-    // 简单解析，支持格式如 "08:00 / 1d" 或 "1h" 或 "30m"
-    if (timeStr.includes('/')) {
-      // 格式: "08:00 / 1d" - 每天8点
-      const [timePart] = timeStr.split(' / ')
-      const [hours, minutes] = timePart.split(':').map(Number)
-      const now = new Date()
-      const targetTime = new Date()
-      targetTime.setHours(hours, minutes, 0, 0)
-      
-      // 如果今天的时间已过，设置为明天
-      if (targetTime <= now) {
-        targetTime.setDate(targetTime.getDate() + 1)
-      }
-      
-      return targetTime.getTime() - now.getTime()
-    } else if (timeStr.includes('h')) {
-      // 格式: "1h" - 1小时后
-      const hours = parseInt(timeStr.replace('h', ''))
-      return hours * 60 * 60 * 1000
-    } else if (timeStr.includes('m')) {
-      // 格式: "30m" - 30分钟后
-      const minutes = parseInt(timeStr.replace('m', ''))
-      return minutes * 60 * 1000
-    } else {
-      // 默认1小时
-      return 60 * 60 * 1000
+  // 计算到下一个指定时间的毫秒数
+  function getMsUntilNextTime(timeStr: string): number {
+    const [hours, minutes] = timeStr.split(':').map(Number)
+    const now = new Date()
+    const target = new Date()
+    target.setHours(hours, minutes, 0, 0)
+    
+    // 如果今天的时间已过，设置为明天
+    if (target <= now) {
+      target.setDate(target.getDate() + 1)
     }
+    
+    return target.getTime() - now.getTime()
   }
 
-  // 设置定时任务
+  // 设置定时任务 - 使用 setTimeout 递归实现精确的每日定时
   function setupSchedule() {
     if (!config.enableSchedule) {
-      logInfo('60s API: 定时发送功能已禁用')
+      logInfo('60s API: 定时发送新闻功能已禁用')
       return
     }
 
     // 清除现有任务
-    if (scheduleInterval) {
-      clearInterval(scheduleInterval)
-      scheduleInterval = null
+    if (scheduleTimeout) {
+      clearTimeout(scheduleTimeout)
+      scheduleTimeout = null
     }
 
     try {
-      const interval = parseScheduleTime(config.scheduleTime)
+      const msUntilNext = getMsUntilNextTime(config.scheduleTime)
       
-      // 设置定时器
-      scheduleInterval = setInterval(async () => {
-        await sendNewsToChannels()
-      }, interval)
-
-      logInfo('60s API: 定时任务设置成功', { 
+      logInfo('60s API: 新闻定时任务已设置', { 
         scheduleTime: config.scheduleTime,
-        interval: interval,
-        channels: config.scheduleWhitelist
+        msUntilNext: msUntilNext,
+        nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
+        whitelist: config.scheduleWhitelist
       })
+
+      scheduleTimeout = setTimeout(async () => {
+        await sendNewsToChannels()
+        // 递归设置下一次执行（24小时后）
+        setupSchedule()
+      }, msUntilNext)
     } catch (error) {
-      logError('60s API: 设置定时任务失败', error)
+      logError('60s API: 设置新闻定时任务失败', error)
     }
   }
 
@@ -811,23 +864,25 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    if (aiNewsScheduleInterval) {
-      clearInterval(aiNewsScheduleInterval)
-      aiNewsScheduleInterval = null
+    if (aiNewsScheduleTimeout) {
+      clearTimeout(aiNewsScheduleTimeout)
+      aiNewsScheduleTimeout = null
     }
 
     try {
-      const interval = parseScheduleTime(config.aiNewsScheduleTime)
+      const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime)
 
-      aiNewsScheduleInterval = setInterval(async () => {
-        await sendAiNewsToChannels()
-      }, interval)
-
-      logInfo('60s API: AI快报定时任务设置成功', {
+      logInfo('60s API: AI快报定时任务已设置', {
         scheduleTime: config.aiNewsScheduleTime,
-        interval: interval,
-        channels: config.scheduleWhitelist
+        msUntilNext: msUntilNext,
+        nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
+        whitelist: config.scheduleWhitelist
       })
+
+      aiNewsScheduleTimeout = setTimeout(async () => {
+        await sendAiNewsToChannels()
+        setupAiNewsSchedule()
+      }, msUntilNext)
     } catch (error) {
       logError('60s API: 设置AI快报定时任务失败', error)
     }
@@ -839,23 +894,25 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    if (moyuScheduleInterval) {
-      clearInterval(moyuScheduleInterval)
-      moyuScheduleInterval = null
+    if (moyuScheduleTimeout) {
+      clearTimeout(moyuScheduleTimeout)
+      moyuScheduleTimeout = null
     }
 
     try {
-      const interval = parseScheduleTime(config.moyuScheduleTime)
+      const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime)
 
-      moyuScheduleInterval = setInterval(async () => {
-        await sendMoyuToChannels()
-      }, interval)
-
-      logInfo('60s API: 摸鱼日报定时任务设置成功', {
+      logInfo('60s API: 摸鱼日报定时任务已设置', {
         scheduleTime: config.moyuScheduleTime,
-        interval: interval,
-        channels: config.scheduleWhitelist
+        msUntilNext: msUntilNext,
+        nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
+        whitelist: config.scheduleWhitelist
       })
+
+      moyuScheduleTimeout = setTimeout(async () => {
+        await sendMoyuToChannels()
+        setupMoyuSchedule()
+      }, msUntilNext)
     } catch (error) {
       logError('60s API: 设置摸鱼日报定时任务失败', error)
     }
@@ -867,23 +924,25 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    if (goldScheduleInterval) {
-      clearInterval(goldScheduleInterval)
-      goldScheduleInterval = null
+    if (goldScheduleTimeout) {
+      clearTimeout(goldScheduleTimeout)
+      goldScheduleTimeout = null
     }
 
     try {
-      const interval = parseScheduleTime(config.goldScheduleTime)
+      const msUntilNext = getMsUntilNextTime(config.goldScheduleTime)
 
-      goldScheduleInterval = setInterval(async () => {
-        await sendGoldToChannels()
-      }, interval)
-
-      logInfo('60s API: 今日金价定时任务设置成功', {
+      logInfo('60s API: 今日金价定时任务已设置', {
         scheduleTime: config.goldScheduleTime,
-        interval: interval,
-        channels: config.scheduleWhitelist
+        msUntilNext: msUntilNext,
+        nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
+        whitelist: config.scheduleWhitelist
       })
+
+      goldScheduleTimeout = setTimeout(async () => {
+        await sendGoldToChannels()
+        setupGoldSchedule()
+      }, msUntilNext)
     } catch (error) {
       logError('60s API: 设置今日金价定时任务失败', error)
     }
@@ -895,23 +954,25 @@ export function apply(ctx: Context, config: Config) {
       return
     }
 
-    if (fuelScheduleInterval) {
-      clearInterval(fuelScheduleInterval)
-      fuelScheduleInterval = null
+    if (fuelScheduleTimeout) {
+      clearTimeout(fuelScheduleTimeout)
+      fuelScheduleTimeout = null
     }
 
     try {
-      const interval = parseScheduleTime(config.fuelScheduleTime)
+      const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime)
 
-      fuelScheduleInterval = setInterval(async () => {
-        await sendFuelToChannels()
-      }, interval)
-
-      logInfo('60s API: 今日油价定时任务设置成功', {
+      logInfo('60s API: 今日油价定时任务已设置', {
         scheduleTime: config.fuelScheduleTime,
-        interval: interval,
-        channels: config.scheduleWhitelist
+        msUntilNext: msUntilNext,
+        nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
+        whitelist: config.scheduleWhitelist
       })
+
+      fuelScheduleTimeout = setTimeout(async () => {
+        await sendFuelToChannels()
+        setupFuelSchedule()
+      }, msUntilNext)
     } catch (error) {
       logError('60s API: 设置今日油价定时任务失败', error)
     }
@@ -1378,35 +1439,35 @@ export function apply(ctx: Context, config: Config) {
 
   // 插件启动时初始化定时任务
   ctx.on('ready', async () => {
-    await setupSchedule()
-    await setupAiNewsSchedule()
-    await setupMoyuSchedule()
-    await setupGoldSchedule()
-    await setupFuelSchedule()
+    setupSchedule()
+    setupAiNewsSchedule()
+    setupMoyuSchedule()
+    setupGoldSchedule()
+    setupFuelSchedule()
   })
 
   // 插件卸载时清理资源
   ctx.on('dispose', () => {
     cooldowns.clear()
-    if (scheduleInterval) {
-      clearInterval(scheduleInterval)
-      scheduleInterval = null
+    if (scheduleTimeout) {
+      clearTimeout(scheduleTimeout)
+      scheduleTimeout = null
     }
-    if (aiNewsScheduleInterval) {
-      clearInterval(aiNewsScheduleInterval)
-      aiNewsScheduleInterval = null
+    if (aiNewsScheduleTimeout) {
+      clearTimeout(aiNewsScheduleTimeout)
+      aiNewsScheduleTimeout = null
     }
-    if (moyuScheduleInterval) {
-      clearInterval(moyuScheduleInterval)
-      moyuScheduleInterval = null
+    if (moyuScheduleTimeout) {
+      clearTimeout(moyuScheduleTimeout)
+      moyuScheduleTimeout = null
     }
-    if (goldScheduleInterval) {
-      clearInterval(goldScheduleInterval)
-      goldScheduleInterval = null
+    if (goldScheduleTimeout) {
+      clearTimeout(goldScheduleTimeout)
+      goldScheduleTimeout = null
     }
-    if (fuelScheduleInterval) {
-      clearInterval(fuelScheduleInterval)
-      fuelScheduleInterval = null
+    if (fuelScheduleTimeout) {
+      clearTimeout(fuelScheduleTimeout)
+      fuelScheduleTimeout = null
     }
   })
 }
