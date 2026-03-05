@@ -8,6 +8,7 @@ export interface Config {
   cooldownTime: number
   enableLog: boolean
   scheduleWhitelist: string[]
+  scheduleCooldown: number
   enableSchedule: boolean
   scheduleTime: string
   useForward: boolean
@@ -26,31 +27,32 @@ export interface Config {
 export const Config: Schema<Config> = Schema.intersect([
   Schema.object({
     apiBaseUrl: Schema.string().default('http://172.0.0.1:4399').description('60s 服务 URL（不含 /v2 路径）'),
-    cooldownTime: Schema.number().default(30).min(5).max(300).description('冷却时间(秒)'),
+    cooldownTime: Schema.number().default(30).min(5).max(300).description('命令冷却时间(秒)，用户手动触发命令的间隔限制'),
+    scheduleCooldown: Schema.number().default(86400).min(0).description('定时任务防重发冷却时间(秒)，0表示不限制。默认86400秒=24小时'),
     enableLog: Schema.boolean().default(true).description('启用日志记录'),
     scheduleWhitelist: Schema.array(String).default([]).description('定时发送群组白名单频道ID列表（格式: platform:channelId，如 onebot:123456）')
   }).description('基础设置'),
   Schema.object({
     enableSchedule: Schema.boolean().default(false).description('启用定时发送新闻'),
-    scheduleTime: Schema.string().default('08:00').description('定时发送时间 (格式: HH:MM，每天固定时间)'),
+    scheduleTime: Schema.string().default('08:00').description('定时发送时间 (格式: HH:MM 或 HH:MM / Nd，如 08:00 或 08:00 / 1d，表示每天或每N天的固定时间)'),
     useForward: Schema.boolean().default(false).description('是否使用合并转发(仅QQ平台效果最佳)')
   }).description('每日新闻'),
   Schema.object({
     enableAiNewsSchedule: Schema.boolean().default(false).description('启用AI快报定时发送(仅当天)'),
-    aiNewsScheduleTime: Schema.string().default('22:00').description('AI快报定时发送时间 (格式: HH:MM，每天固定时间)'),
+    aiNewsScheduleTime: Schema.string().default('22:00').description('AI快报定时发送时间 (格式: HH:MM 或 HH:MM / Nd，如 22:00 或 22:00 / 1d)'),
     aiUseForward: Schema.boolean().default(false).description('AI快报是否使用合并转发(仅QQ平台效果最佳)')
   }).description('AI快报'),
   Schema.object({
     enableMoyuSchedule: Schema.boolean().default(false).description('启用摸鱼日报定时发送'),
-    moyuScheduleTime: Schema.string().default('10:00').description('摸鱼日报定时发送时间 (格式: HH:MM，每天固定时间)'),
+    moyuScheduleTime: Schema.string().default('10:00').description('摸鱼日报定时发送时间 (格式: HH:MM 或 HH:MM / Nd，如 10:00 或 10:00 / 1d)'),
   }).description('摸鱼日报'),
   Schema.object({
     enableGoldSchedule: Schema.boolean().default(false).description('启用今日金价定时发送'),
-    goldScheduleTime: Schema.string().default('09:00').description('今日金价定时发送时间 (格式: HH:MM，每天固定时间)'),
+    goldScheduleTime: Schema.string().default('09:00').description('今日金价定时发送时间 (格式: HH:MM 或 HH:MM / Nd，如 09:00 或 09:00 / 1d)'),
   }).description('今日金价'),
   Schema.object({
     enableFuelSchedule: Schema.boolean().default(false).description('启用今日油价定时发送'),
-    fuelScheduleTime: Schema.string().default('09:30').description('今日油价定时发送时间 (格式: HH:MM，每天固定时间)'),
+    fuelScheduleTime: Schema.string().default('09:30').description('今日油价定时发送时间 (格式: HH:MM 或 HH:MM / Nd，如 09:30 或 09:30 / 1d)'),
     fuelDefaultRegion: Schema.string().default('上海').description('今日油价默认地区')
   }).description('今日油价')
 ])
@@ -283,13 +285,37 @@ export function apply(ctx: Context, config: Config) {
   let goldScheduleTimeout: NodeJS.Timeout | null = null
   let fuelScheduleTimeout: NodeJS.Timeout | null = null
   
-  // 记录今日已发送状态，防止重复发送
-  const sentToday = {
-    news: '',
-    aiNews: '',
-    moyu: '',
-    gold: '',
-    fuel: ''
+  // 记录上次发送时间戳，用于冷却控制（毫秒）
+  const lastSentTime = {
+    news: 0,
+    aiNews: 0,
+    moyu: 0,
+    gold: 0,
+    fuel: 0
+  }
+  
+  // 检查是否在冷却时间内
+  function isInCooldown(type: keyof typeof lastSentTime): boolean {
+    // scheduleCooldown 为 0 表示不限制
+    if (config.scheduleCooldown <= 0) {
+      return false
+    }
+    const now = Date.now()
+    const lastTime = lastSentTime[type]
+    const cooldownMs = config.scheduleCooldown * 1000
+    return now - lastTime < cooldownMs
+  }
+  
+  // 获取剩余冷却时间（秒）
+  function getRemainingCooldown(type: keyof typeof lastSentTime): number {
+    if (config.scheduleCooldown <= 0) {
+      return 0
+    }
+    const now = Date.now()
+    const lastTime = lastSentTime[type]
+    const cooldownMs = config.scheduleCooldown * 1000
+    const remaining = Math.ceil((lastTime + cooldownMs - now) / 1000)
+    return Math.max(0, remaining)
   }
   
   // 获取今日日期字符串 YYYY-MM-DD
@@ -731,9 +757,10 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function formatGoldText(data: GoldData): string {
-    // 只返回今日金价和伦敦金
+    // 只返回黄金价格、伦敦金(现货黄金)、白银价格、钯金价格
+    const targetKeywords = ['黄金', '伦敦金', '白银', '钯金']
     const metals = data.metals
-      .filter(item => item.name.includes('金价') || item.name.includes('伦敦金'))
+      .filter(item => targetKeywords.some(keyword => item.name.includes(keyword)))
       .map((item) => {
         return `${item.name}: ${item.today_price}${item.unit}`
       })
@@ -816,23 +843,61 @@ export function apply(ctx: Context, config: Config) {
   }
 
   // 计算到下一个指定时间的毫秒数
-  function getMsUntilNextTime(timeStr: string): number {
-    const [hours, minutes] = timeStr.split(':').map(Number)
+  // 支持格式: HH:MM 或 HH:MM / Nd (如 08:00 或 08:00 / 1d)
+  // 返回 null 表示时间格式错误，应该跳过今天
+  function getMsUntilNextTime(timeStr: string): number | null {
+    const trimmedTimeStr = timeStr.trim()
+    
+    // 解析时间格式，支持 HH:MM 或 HH:MM / Nd
+    // 格式: HH:MM / Nd 表示每 N 天的 HH:MM 执行
+    const fullPattern = /^([0-1]?\d|2[0-3]):([0-5]\d)\s*(?:\/\s*(\d+)\s*d)?$/
+    const match = trimmedTimeStr.match(fullPattern)
+    
+    if (!match) {
+      logError('60s API: 时间格式无效，跳过今天', { timeStr })
+      return null
+    }
+    
+    const hours = parseInt(match[1], 10)
+    const minutes = parseInt(match[2], 10)
+    const daysInterval = match[3] ? parseInt(match[3], 10) : 1 // 默认为每天
+    
     const now = new Date()
     const target = new Date()
     target.setHours(hours, minutes, 0, 0)
     
-    // 如果今天的时间已过，设置为明天
+    // 如果今天的时间已过，设置为下一天的间隔
     if (target <= now) {
-      target.setDate(target.getDate() + 1)
+      target.setDate(target.getDate() + daysInterval)
     }
     
-    return target.getTime() - now.getTime()
+    const msUntilNext = target.getTime() - now.getTime()
+    
+    // 如果计算结果无效，跳过今天
+    if (!isFinite(msUntilNext) || msUntilNext <= 0) {
+      logError('60s API: 计算的时间无效，跳过今天', { timeStr, msUntilNext })
+      return null
+    }
+    
+    return msUntilNext
   }
   
   // 检查指定时间是否在今天已过
+  // 支持格式: HH:MM 或 HH:MM / Nd
   function isTimePassedToday(timeStr: string): boolean {
-    const [hours, minutes] = timeStr.split(':').map(Number)
+    const trimmedTimeStr = timeStr.trim()
+    
+    // 解析时间格式，支持 HH:MM 或 HH:MM / Nd
+    const fullPattern = /^([0-1]?\d|2[0-3]):([0-5]\d)\s*(?:\/\s*(\d+)\s*d)?$/
+    const match = trimmedTimeStr.match(fullPattern)
+    
+    if (!match) {
+      return false
+    }
+    
+    const hours = parseInt(match[1], 10)
+    const minutes = parseInt(match[2], 10)
+    
     const now = new Date()
     const target = new Date()
     target.setHours(hours, minutes, 0, 0)
@@ -854,13 +919,23 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const today = getTodayString()
+      const remainingCooldown = getRemainingCooldown('news')
       
-      // 如果今天已经发送过，直接设置为明天的任务
-      if (sentToday.news === today) {
-        logInfo('60s API: 今日新闻已发送过，设置为明天任务', { today })
-        const msUntilNext = getMsUntilNextTime(config.scheduleTime) + 24 * 60 * 60 * 1000
+      // 如果在冷却时间内，跳过本次发送
+      if (isInCooldown('news')) {
+        logInfo('60s API: 新闻发送冷却中，跳过本次发送', { 
+          today, 
+          remainingCooldownSec: remainingCooldown,
+          scheduleCooldown: config.scheduleCooldown 
+        })
+        const msUntilNext = getMsUntilNextTime(config.scheduleTime)
+        if (msUntilNext === null) {
+          scheduleTimeout = setTimeout(() => {
+            setupSchedule()
+          }, 24 * 60 * 60 * 1000)
+          return
+        }
         scheduleTimeout = setTimeout(() => {
-          sentToday.news = ''  // 重置发送状态
           setupSchedule()
         }, msUntilNext)
         return
@@ -868,26 +943,35 @@ export function apply(ctx: Context, config: Config) {
       
       const msUntilNext = getMsUntilNextTime(config.scheduleTime)
       
+      // 时间格式错误，跳过今天
+      if (msUntilNext === null) {
+        logError('60s API: 新闻定时任务时间格式错误，跳过今天', { scheduleTime: config.scheduleTime })
+        scheduleTimeout = setTimeout(() => {
+          setupSchedule()
+        }, 24 * 60 * 60 * 1000)
+        return
+      }
+      
       logInfo('60s API: 新闻定时任务已设置', { 
         scheduleTime: config.scheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
         whitelist: config.scheduleWhitelist,
-        today,
-        alreadySent: sentToday.news === today
+        scheduleCooldown: config.scheduleCooldown
       })
 
       scheduleTimeout = setTimeout(async () => {
-        // 再次检查今天是否已发送（防止短时间内多次触发）
-        if (sentToday.news === getTodayString()) {
-          logInfo('60s API: 今日新闻已在本次任务等待期间发送，跳过')
-          setupSchedule()  // 重新设置为明天
+        // 再次检查是否在冷却时间内
+        if (isInCooldown('news')) {
+          logInfo('60s API: 新闻发送冷却中，跳过本次发送', { 
+            remainingCooldownSec: getRemainingCooldown('news') 
+          })
+          setupSchedule()
           return
         }
         
         await sendNewsToChannels()
-        sentToday.news = getTodayString()
-        // 递归设置下一次执行
+        lastSentTime.news = Date.now()
         setupSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -908,13 +992,23 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const today = getTodayString()
+      const remainingCooldown = getRemainingCooldown('aiNews')
       
-      // 如果今天已经发送过，直接设置为明天的任务
-      if (sentToday.aiNews === today) {
-        logInfo('60s API: 今日AI快报已发送过，设置为明天任务', { today })
-        const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime) + 24 * 60 * 60 * 1000
+      // 如果在冷却时间内，跳过本次发送
+      if (isInCooldown('aiNews')) {
+        logInfo('60s API: AI快报发送冷却中，跳过本次发送', { 
+          today, 
+          remainingCooldownSec: remainingCooldown,
+          scheduleCooldown: config.scheduleCooldown 
+        })
+        const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime)
+        if (msUntilNext === null) {
+          aiNewsScheduleTimeout = setTimeout(() => {
+            setupAiNewsSchedule()
+          }, 24 * 60 * 60 * 1000)
+          return
+        }
         aiNewsScheduleTimeout = setTimeout(() => {
-          sentToday.aiNews = ''
           setupAiNewsSchedule()
         }, msUntilNext)
         return
@@ -922,22 +1016,35 @@ export function apply(ctx: Context, config: Config) {
 
       const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime)
 
+      // 时间格式错误，跳过今天
+      if (msUntilNext === null) {
+        logError('60s API: AI快报定时任务时间格式错误，跳过今天', { scheduleTime: config.aiNewsScheduleTime })
+        aiNewsScheduleTimeout = setTimeout(() => {
+          setupAiNewsSchedule()
+        }, 24 * 60 * 60 * 1000)
+        return
+      }
+
       logInfo('60s API: AI快报定时任务已设置', {
         scheduleTime: config.aiNewsScheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
-        whitelist: config.scheduleWhitelist
+        whitelist: config.scheduleWhitelist,
+        scheduleCooldown: config.scheduleCooldown
       })
 
       aiNewsScheduleTimeout = setTimeout(async () => {
-        if (sentToday.aiNews === getTodayString()) {
-          logInfo('60s API: 今日AI快报已在本次任务等待期间发送，跳过')
+        // 再次检查是否在冷却时间内
+        if (isInCooldown('aiNews')) {
+          logInfo('60s API: AI快报发送冷却中，跳过本次发送', { 
+            remainingCooldownSec: getRemainingCooldown('aiNews') 
+          })
           setupAiNewsSchedule()
           return
         }
         
         await sendAiNewsToChannels()
-        sentToday.aiNews = getTodayString()
+        lastSentTime.aiNews = Date.now()
         setupAiNewsSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -958,12 +1065,23 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const today = getTodayString()
+      const remainingCooldown = getRemainingCooldown('moyu')
       
-      if (sentToday.moyu === today) {
-        logInfo('60s API: 今日摸鱼日报已发送过，设置为明天任务', { today })
-        const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime) + 24 * 60 * 60 * 1000
+      // 如果在冷却时间内，跳过本次发送
+      if (isInCooldown('moyu')) {
+        logInfo('60s API: 摸鱼日报发送冷却中，跳过本次发送', { 
+          today, 
+          remainingCooldownSec: remainingCooldown,
+          scheduleCooldown: config.scheduleCooldown 
+        })
+        const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime)
+        if (msUntilNext === null) {
+          moyuScheduleTimeout = setTimeout(() => {
+            setupMoyuSchedule()
+          }, 24 * 60 * 60 * 1000)
+          return
+        }
         moyuScheduleTimeout = setTimeout(() => {
-          sentToday.moyu = ''
           setupMoyuSchedule()
         }, msUntilNext)
         return
@@ -971,22 +1089,35 @@ export function apply(ctx: Context, config: Config) {
 
       const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime)
 
+      // 时间格式错误，跳过今天
+      if (msUntilNext === null) {
+        logError('60s API: 摸鱼日报定时任务时间格式错误，跳过今天', { scheduleTime: config.moyuScheduleTime })
+        moyuScheduleTimeout = setTimeout(() => {
+          setupMoyuSchedule()
+        }, 24 * 60 * 60 * 1000)
+        return
+      }
+
       logInfo('60s API: 摸鱼日报定时任务已设置', {
         scheduleTime: config.moyuScheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
-        whitelist: config.scheduleWhitelist
+        whitelist: config.scheduleWhitelist,
+        scheduleCooldown: config.scheduleCooldown
       })
 
       moyuScheduleTimeout = setTimeout(async () => {
-        if (sentToday.moyu === getTodayString()) {
-          logInfo('60s API: 今日摸鱼日报已在本次任务等待期间发送，跳过')
+        // 再次检查是否在冷却时间内
+        if (isInCooldown('moyu')) {
+          logInfo('60s API: 摸鱼日报发送冷却中，跳过本次发送', { 
+            remainingCooldownSec: getRemainingCooldown('moyu') 
+          })
           setupMoyuSchedule()
           return
         }
         
         await sendMoyuToChannels()
-        sentToday.moyu = getTodayString()
+        lastSentTime.moyu = Date.now()
         setupMoyuSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -1007,12 +1138,23 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const today = getTodayString()
+      const remainingCooldown = getRemainingCooldown('gold')
       
-      if (sentToday.gold === today) {
-        logInfo('60s API: 今日金价已发送过，设置为明天任务', { today })
-        const msUntilNext = getMsUntilNextTime(config.goldScheduleTime) + 24 * 60 * 60 * 1000
+      // 如果在冷却时间内，跳过本次发送
+      if (isInCooldown('gold')) {
+        logInfo('60s API: 今日金价发送冷却中，跳过本次发送', { 
+          today, 
+          remainingCooldownSec: remainingCooldown,
+          scheduleCooldown: config.scheduleCooldown 
+        })
+        const msUntilNext = getMsUntilNextTime(config.goldScheduleTime)
+        if (msUntilNext === null) {
+          goldScheduleTimeout = setTimeout(() => {
+            setupGoldSchedule()
+          }, 24 * 60 * 60 * 1000)
+          return
+        }
         goldScheduleTimeout = setTimeout(() => {
-          sentToday.gold = ''
           setupGoldSchedule()
         }, msUntilNext)
         return
@@ -1020,22 +1162,35 @@ export function apply(ctx: Context, config: Config) {
 
       const msUntilNext = getMsUntilNextTime(config.goldScheduleTime)
 
+      // 时间格式错误，跳过今天
+      if (msUntilNext === null) {
+        logError('60s API: 今日金价定时任务时间格式错误，跳过今天', { scheduleTime: config.goldScheduleTime })
+        goldScheduleTimeout = setTimeout(() => {
+          setupGoldSchedule()
+        }, 24 * 60 * 60 * 1000)
+        return
+      }
+
       logInfo('60s API: 今日金价定时任务已设置', {
         scheduleTime: config.goldScheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
-        whitelist: config.scheduleWhitelist
+        whitelist: config.scheduleWhitelist,
+        scheduleCooldown: config.scheduleCooldown
       })
 
       goldScheduleTimeout = setTimeout(async () => {
-        if (sentToday.gold === getTodayString()) {
-          logInfo('60s API: 今日金价已在本次任务等待期间发送，跳过')
+        // 再次检查是否在冷却时间内
+        if (isInCooldown('gold')) {
+          logInfo('60s API: 今日金价发送冷却中，跳过本次发送', { 
+            remainingCooldownSec: getRemainingCooldown('gold') 
+          })
           setupGoldSchedule()
           return
         }
         
         await sendGoldToChannels()
-        sentToday.gold = getTodayString()
+        lastSentTime.gold = Date.now()
         setupGoldSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -1056,12 +1211,23 @@ export function apply(ctx: Context, config: Config) {
 
     try {
       const today = getTodayString()
+      const remainingCooldown = getRemainingCooldown('fuel')
       
-      if (sentToday.fuel === today) {
-        logInfo('60s API: 今日油价已发送过，设置为明天任务', { today })
-        const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime) + 24 * 60 * 60 * 1000
+      // 如果在冷却时间内，跳过本次发送
+      if (isInCooldown('fuel')) {
+        logInfo('60s API: 今日油价发送冷却中，跳过本次发送', { 
+          today, 
+          remainingCooldownSec: remainingCooldown,
+          scheduleCooldown: config.scheduleCooldown 
+        })
+        const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime)
+        if (msUntilNext === null) {
+          fuelScheduleTimeout = setTimeout(() => {
+            setupFuelSchedule()
+          }, 24 * 60 * 60 * 1000)
+          return
+        }
         fuelScheduleTimeout = setTimeout(() => {
-          sentToday.fuel = ''
           setupFuelSchedule()
         }, msUntilNext)
         return
@@ -1069,22 +1235,35 @@ export function apply(ctx: Context, config: Config) {
 
       const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime)
 
+      // 时间格式错误，跳过今天
+      if (msUntilNext === null) {
+        logError('60s API: 今日油价定时任务时间格式错误，跳过今天', { scheduleTime: config.fuelScheduleTime })
+        fuelScheduleTimeout = setTimeout(() => {
+          setupFuelSchedule()
+        }, 24 * 60 * 60 * 1000)
+        return
+      }
+
       logInfo('60s API: 今日油价定时任务已设置', {
         scheduleTime: config.fuelScheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
-        whitelist: config.scheduleWhitelist
+        whitelist: config.scheduleWhitelist,
+        scheduleCooldown: config.scheduleCooldown
       })
 
       fuelScheduleTimeout = setTimeout(async () => {
-        if (sentToday.fuel === getTodayString()) {
-          logInfo('60s API: 今日油价已在本次任务等待期间发送，跳过')
+        // 再次检查是否在冷却时间内
+        if (isInCooldown('fuel')) {
+          logInfo('60s API: 今日油价发送冷却中，跳过本次发送', { 
+            remainingCooldownSec: getRemainingCooldown('fuel') 
+          })
           setupFuelSchedule()
           return
         }
         
         await sendFuelToChannels()
-        sentToday.fuel = getTodayString()
+        lastSentTime.fuel = Date.now()
         setupFuelSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -1577,10 +1756,10 @@ export function apply(ctx: Context, config: Config) {
       fuelScheduleTimeout = null
     }
     // 重置发送记录
-    sentToday.news = ''
-    sentToday.aiNews = ''
-    sentToday.moyu = ''
-    sentToday.gold = ''
-    sentToday.fuel = ''
+    lastSentTime.news = 0
+    lastSentTime.aiNews = 0
+    lastSentTime.moyu = 0
+    lastSentTime.gold = 0
+    lastSentTime.fuel = 0
   })
 }
