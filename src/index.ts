@@ -282,6 +282,24 @@ export function apply(ctx: Context, config: Config) {
   let moyuScheduleTimeout: NodeJS.Timeout | null = null
   let goldScheduleTimeout: NodeJS.Timeout | null = null
   let fuelScheduleTimeout: NodeJS.Timeout | null = null
+  
+  // 记录今日已发送状态，防止重复发送
+  const sentToday = {
+    news: '',
+    aiNews: '',
+    moyu: '',
+    gold: '',
+    fuel: ''
+  }
+  
+  // 获取今日日期字符串 YYYY-MM-DD
+  function getTodayString(): string {
+    const now = new Date()
+    const year = now.getFullYear()
+    const month = `${now.getMonth() + 1}`.padStart(2, '0')
+    const day = `${now.getDate()}`.padStart(2, '0')
+    return `${year}-${month}-${day}`
+  }
 
   async function resolveGroupScheduleChannels(whitelist: string[], tag: string): Promise<string[]> {
     try {
@@ -824,6 +842,15 @@ export function apply(ctx: Context, config: Config) {
     
     return target.getTime() - now.getTime()
   }
+  
+  // 检查指定时间是否在今天已过
+  function isTimePassedToday(timeStr: string): boolean {
+    const [hours, minutes] = timeStr.split(':').map(Number)
+    const now = new Date()
+    const target = new Date()
+    target.setHours(hours, minutes, 0, 0)
+    return target <= now
+  }
 
   // 设置定时任务 - 使用 setTimeout 递归实现精确的每日定时
   function setupSchedule() {
@@ -839,18 +866,41 @@ export function apply(ctx: Context, config: Config) {
     }
 
     try {
+      const today = getTodayString()
+      
+      // 如果今天已经发送过，直接设置为明天的任务
+      if (sentToday.news === today) {
+        logInfo('60s API: 今日新闻已发送过，设置为明天任务', { today })
+        const msUntilNext = getMsUntilNextTime(config.scheduleTime) + 24 * 60 * 60 * 1000
+        scheduleTimeout = setTimeout(() => {
+          sentToday.news = ''  // 重置发送状态
+          setupSchedule()
+        }, msUntilNext)
+        return
+      }
+      
       const msUntilNext = getMsUntilNextTime(config.scheduleTime)
       
       logInfo('60s API: 新闻定时任务已设置', { 
         scheduleTime: config.scheduleTime,
         msUntilNext: msUntilNext,
         nextRun: new Date(Date.now() + msUntilNext).toLocaleString(),
-        whitelist: config.scheduleWhitelist
+        whitelist: config.scheduleWhitelist,
+        today,
+        alreadySent: sentToday.news === today
       })
 
       scheduleTimeout = setTimeout(async () => {
+        // 再次检查今天是否已发送（防止短时间内多次触发）
+        if (sentToday.news === getTodayString()) {
+          logInfo('60s API: 今日新闻已在本次任务等待期间发送，跳过')
+          setupSchedule()  // 重新设置为明天
+          return
+        }
+        
         await sendNewsToChannels()
-        // 递归设置下一次执行（24小时后）
+        sentToday.news = getTodayString()
+        // 递归设置下一次执行
         setupSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -870,6 +920,19 @@ export function apply(ctx: Context, config: Config) {
     }
 
     try {
+      const today = getTodayString()
+      
+      // 如果今天已经发送过，直接设置为明天的任务
+      if (sentToday.aiNews === today) {
+        logInfo('60s API: 今日AI快报已发送过，设置为明天任务', { today })
+        const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime) + 24 * 60 * 60 * 1000
+        aiNewsScheduleTimeout = setTimeout(() => {
+          sentToday.aiNews = ''
+          setupAiNewsSchedule()
+        }, msUntilNext)
+        return
+      }
+
       const msUntilNext = getMsUntilNextTime(config.aiNewsScheduleTime)
 
       logInfo('60s API: AI快报定时任务已设置', {
@@ -880,7 +943,14 @@ export function apply(ctx: Context, config: Config) {
       })
 
       aiNewsScheduleTimeout = setTimeout(async () => {
+        if (sentToday.aiNews === getTodayString()) {
+          logInfo('60s API: 今日AI快报已在本次任务等待期间发送，跳过')
+          setupAiNewsSchedule()
+          return
+        }
+        
         await sendAiNewsToChannels()
+        sentToday.aiNews = getTodayString()
         setupAiNewsSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -900,6 +970,18 @@ export function apply(ctx: Context, config: Config) {
     }
 
     try {
+      const today = getTodayString()
+      
+      if (sentToday.moyu === today) {
+        logInfo('60s API: 今日摸鱼日报已发送过，设置为明天任务', { today })
+        const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime) + 24 * 60 * 60 * 1000
+        moyuScheduleTimeout = setTimeout(() => {
+          sentToday.moyu = ''
+          setupMoyuSchedule()
+        }, msUntilNext)
+        return
+      }
+
       const msUntilNext = getMsUntilNextTime(config.moyuScheduleTime)
 
       logInfo('60s API: 摸鱼日报定时任务已设置', {
@@ -910,7 +992,14 @@ export function apply(ctx: Context, config: Config) {
       })
 
       moyuScheduleTimeout = setTimeout(async () => {
+        if (sentToday.moyu === getTodayString()) {
+          logInfo('60s API: 今日摸鱼日报已在本次任务等待期间发送，跳过')
+          setupMoyuSchedule()
+          return
+        }
+        
         await sendMoyuToChannels()
+        sentToday.moyu = getTodayString()
         setupMoyuSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -930,6 +1019,18 @@ export function apply(ctx: Context, config: Config) {
     }
 
     try {
+      const today = getTodayString()
+      
+      if (sentToday.gold === today) {
+        logInfo('60s API: 今日金价已发送过，设置为明天任务', { today })
+        const msUntilNext = getMsUntilNextTime(config.goldScheduleTime) + 24 * 60 * 60 * 1000
+        goldScheduleTimeout = setTimeout(() => {
+          sentToday.gold = ''
+          setupGoldSchedule()
+        }, msUntilNext)
+        return
+      }
+
       const msUntilNext = getMsUntilNextTime(config.goldScheduleTime)
 
       logInfo('60s API: 今日金价定时任务已设置', {
@@ -940,7 +1041,14 @@ export function apply(ctx: Context, config: Config) {
       })
 
       goldScheduleTimeout = setTimeout(async () => {
+        if (sentToday.gold === getTodayString()) {
+          logInfo('60s API: 今日金价已在本次任务等待期间发送，跳过')
+          setupGoldSchedule()
+          return
+        }
+        
         await sendGoldToChannels()
+        sentToday.gold = getTodayString()
         setupGoldSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -960,6 +1068,18 @@ export function apply(ctx: Context, config: Config) {
     }
 
     try {
+      const today = getTodayString()
+      
+      if (sentToday.fuel === today) {
+        logInfo('60s API: 今日油价已发送过，设置为明天任务', { today })
+        const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime) + 24 * 60 * 60 * 1000
+        fuelScheduleTimeout = setTimeout(() => {
+          sentToday.fuel = ''
+          setupFuelSchedule()
+        }, msUntilNext)
+        return
+      }
+
       const msUntilNext = getMsUntilNextTime(config.fuelScheduleTime)
 
       logInfo('60s API: 今日油价定时任务已设置', {
@@ -970,7 +1090,14 @@ export function apply(ctx: Context, config: Config) {
       })
 
       fuelScheduleTimeout = setTimeout(async () => {
+        if (sentToday.fuel === getTodayString()) {
+          logInfo('60s API: 今日油价已在本次任务等待期间发送，跳过')
+          setupFuelSchedule()
+          return
+        }
+        
         await sendFuelToChannels()
+        sentToday.fuel = getTodayString()
         setupFuelSchedule()
       }, msUntilNext)
     } catch (error) {
@@ -1469,5 +1596,11 @@ export function apply(ctx: Context, config: Config) {
       clearTimeout(fuelScheduleTimeout)
       fuelScheduleTimeout = null
     }
+    // 重置发送记录
+    sentToday.news = ''
+    sentToday.aiNews = ''
+    sentToday.moyu = ''
+    sentToday.gold = ''
+    sentToday.fuel = ''
   })
 }
