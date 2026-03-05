@@ -731,29 +731,16 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function formatGoldText(data: GoldData): string {
-    const metals = data.metals.slice(0, 5).map((item, index) => {
-      return `${index + 1}. ${item.name} ${item.today_price}${item.unit} (最高${item.high_price} / 最低${item.low_price})`
-    })
-    const stores = data.stores.slice(0, 5).map((item, index) => {
-      return `${index + 1}. ${item.brand} ${item.product} ${item.formatted}`
-    })
-    const banks = data.banks.slice(0, 5).map((item, index) => {
-      return `${index + 1}. ${item.bank} ${item.product} ${item.formatted}`
-    })
-    const recycle = data.recycle.slice(0, 5).map((item, index) => {
-      return `${index + 1}. ${item.type} ${item.formatted} (${item.purity})`
-    })
+    // 只返回今日金价和伦敦金
+    const metals = data.metals
+      .filter(item => item.name.includes('金价') || item.name.includes('伦敦金'))
+      .map((item) => {
+        return `${item.name}: ${item.today_price}${item.unit}`
+      })
 
     return [
       `💰 今日金价 ${data.date}`,
-      `-- 金属行情 --`,
-      ...metals,
-      `-- 金店报价 --`,
-      ...stores,
-      `-- 银行报价 --`,
-      ...banks,
-      `-- 回收报价 --`,
-      ...recycle
+      ...metals
     ].join('\n')
   }
 
@@ -1310,7 +1297,6 @@ export function apply(ctx: Context, config: Config) {
     })
 
   ctx.command('AI快报 [date]', '获取AI资讯快报')
-    .option('date', '-d <date> 指定日期 (格式: YYYY-MM-DD)')
     .option('all', '-a 获取所有日期')
     .option('encoding', '-e <encoding> 编码方式 text/json/markdown')
     .action(async (argv, date) => {
@@ -1324,16 +1310,19 @@ export function apply(ctx: Context, config: Config) {
       }
 
       try {
-        logInfo('60s API: 用户请求AI快报', { userId })
+        logInfo('60s API: 用户请求AI快报', { userId, date, all: argv.options.all, encoding: argv.options.encoding })
 
         const encoding = argv.options.encoding || 'text'
         const all = argv.options.all ? '1' : undefined
-        const targetDate = argv.options.date || date
+        // 优先使用位置参数 date，如果未提供则获取最近两天
+        const targetDate = date?.trim()
 
+        // 如果没有指定日期且不是获取所有日期，默认获取最近两天
         if (!targetDate && !all) {
           const dates = getRecentAiNewsDates()
           const data = await fetchAiNewsByDates(dates)
           if (!data.length) return '未获取到近两天的AI快报数据'
+          
           if (encoding === 'json') {
             await argv.session.send(JSON.stringify(toTitleLinkData(data), null, 2))
             return
@@ -1342,6 +1331,7 @@ export function apply(ctx: Context, config: Config) {
             await argv.session.send(formatAiNewsMarkdown(data))
             return
           }
+          
           const message = formatAiNewsText(data)
           if (config.aiUseForward && argv.session.platform === 'onebot') {
             await argv.session.send(h('figure', {}, [message]))
@@ -1351,44 +1341,34 @@ export function apply(ctx: Context, config: Config) {
           return
         }
 
-        if (encoding === 'json') {
-          const response = await getAiNews({ date: targetDate, all, encoding: 'json' }) as AiNewsResponse
-          if (response.code !== 200 || !response.data) {
-            logError('60s API: AI快报返回错误', { code: response.code, message: response.message })
-            return `获取AI快报失败: ${response.message || '未知错误'}`
-          }
-          await argv.session.send(JSON.stringify(toTitleLinkData(response.data), null, 2))
-          return
-        }
-
-        if (encoding === 'markdown') {
-          const response = await getAiNews({ date: targetDate, all, encoding: 'json' }) as AiNewsResponse
-          if (response.code !== 200 || !response.data) {
-            logError('60s API: AI快报返回错误', { code: response.code, message: response.message })
-            return `获取AI快报失败: ${response.message || '未知错误'}`
-          }
-          await argv.session.send(formatAiNewsMarkdown(response.data))
-          return
-        }
-
+        // 获取指定日期或所有日期的数据
         const response = await getAiNews({ date: targetDate, all, encoding: 'json' }) as AiNewsResponse
         if (response.code !== 200 || !response.data) {
           logError('60s API: AI快报返回错误', { code: response.code, message: response.message })
           return `获取AI快报失败: ${response.message || '未知错误'}`
         }
 
-        const message = formatAiNewsText(response.data)
+        // 根据编码格式返回
+        if (encoding === 'json') {
+          await argv.session.send(JSON.stringify(toTitleLinkData(response.data), null, 2))
+          return
+        }
+        if (encoding === 'markdown') {
+          await argv.session.send(formatAiNewsMarkdown(response.data))
+          return
+        }
 
+        // 默认文本格式
+        const message = formatAiNewsText(response.data)
         if (config.aiUseForward && argv.session.platform === 'onebot') {
-          const forwardMessage = h('figure', {}, [message])
-          await argv.session.send(forwardMessage)
+          await argv.session.send(h('figure', {}, [message]))
         } else {
           await argv.session.send(message)
         }
 
         logInfo('60s API: 成功发送AI快报', {
           userId: userId,
-          date: targetDate || 'today',
+          date: targetDate || 'recent',
           all: all || '0'
         })
       } catch (error) {
