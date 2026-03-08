@@ -757,10 +757,10 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function formatGoldText(data: GoldData): string {
-    // 只返回黄金价格、伦敦金(现货黄金)、白银价格、钯金价格
-    const targetKeywords = ['黄金', '伦敦金', '白银', '钯金']
+    // 精确匹配只保留：黄金、伦敦金(现货黄金)、白银、钯金
+    const targetNames = ['今日金价', '伦敦金(现货黄金)', '白银价格', '铂金价格', '钯金价格']
     const metals = data.metals
-      .filter(item => targetKeywords.some(keyword => item.name.includes(keyword)))
+      .filter(item => targetNames.includes(item.name))
       .map((item) => {
         return `${item.name}: ${item.today_price}${item.unit}`
       })
