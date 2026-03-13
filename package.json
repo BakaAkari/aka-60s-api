@@ -1,0 +1,35 @@
+{
+  "name": "koishi-plugin-aka-60s-api",
+  "description": "调用60s API转发信息的工具 - 个人用",
+  "version": "0.2.12",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "files": [
+    "lib"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "clean": "rimraf lib tsconfig.tsbuildinfo",
+    "dev": "tsc --project tsconfig.json --watch",
+    "prepublishOnly": "pnpm run clean && pnpm run build",
+    "typecheck": "tsc --project tsconfig.json --noEmit"
+  },
+  "keywords": [
+    "chatbot",
+    "koishi",
+    "plugin"
+  ],
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "koishi": "^4.18.9",
+    "rimraf": "^6.0.1",
+    "typescript": "^5.0.0"
+  },
+  "peerDependencies": {
+    "koishi": "^4.18.9"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
