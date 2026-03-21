@@ -757,11 +757,21 @@ export function apply(ctx: Context, config: Config) {
   }
 
   function formatGoldText(data: GoldData): string {
-    const goldItem = data.metals.find(item => item.name === '今日金价')
-    if (!goldItem) {
-      return `💰 今日金价 ${data.date}\n暂无数据`
-    }
-    return `💰 今日金价 ${data.date}\n金价: ${goldItem.today_price}${goldItem.unit}`
+    const targetNames = ['今日金价', '伦敦金(现货黄金)', '白银价格']
+    const metals = data.metals
+      .filter(item => targetNames.includes(item.name))
+      .map(item => {
+        // 处理伦敦金可能显示 N/A 的情况
+        let price = item.today_price
+        if (item.name === '伦敦金(现货黄金)' && (!price || price === 'N' || price === 'N/A')) {
+          price = item.sell_price || '暂无数据'
+        }
+        return `${item.name}: ${price}${item.unit}`
+      })
+    return [
+      `💰 今日金价 ${data.date}`,
+      ...metals
+    ].join('\n')
   }
 
   function formatFuelText(data: FuelData): string {
